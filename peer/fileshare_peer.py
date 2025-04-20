@@ -174,7 +174,7 @@ def add_local_shared_file(filename, filepath):
 if __name__ == "__main__":
   # Example: Add a file to share locally when the peer starts
   # In a real app, this would be driven by user input in the client UI
-  example_filename = "my_shared_file.txt"
+  example_filename = "shared_peer_files/my_shared_file.txt"
   if os.path.exists(example_filename):
        add_local_shared_file(example_filename, example_filename)
   else:
