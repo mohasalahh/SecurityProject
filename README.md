@@ -1,4 +1,4 @@
-**CipherShare: Phase 1 - Basic P2P File Transfer**
+# CipherShare: Phase 1 - Basic P2P File Transfer
 
 **Course:** CSE451: Computer and Network Security - Ain Shams University
 
