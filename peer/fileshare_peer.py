@@ -5,358 +5,273 @@ import os
 import json
 import secrets
 import sys
-import uuid # For unique filenames in storage
+import uuid
 
 # --- Add project root to sys.path ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-# --- End of sys.path modification ---
+if project_root not in sys.path: sys.path.insert(0, project_root)
 
 from helpers import crypto_utils
 
 # ANSI Color Codes
-COLOR_RESET = "\033[0m"
-COLOR_RED = "\033[91m"
-COLOR_GREEN = "\033[92m"
-COLOR_YELLOW = "\033[93m"
-COLOR_BLUE = "\033[94m"
-COLOR_MAGENTA = "\033[95m"
-COLOR_CYAN = "\033[96m"
+COLOR_RESET, COLOR_RED, COLOR_GREEN, COLOR_YELLOW, COLOR_BLUE, COLOR_MAGENTA, COLOR_CYAN = \
+    "\033[0m", "\033[91m", "\033[92m", "\033[93m", "\033[94m", "\033[95m", "\033[96m"
 
 # --- Peer Configuration ---
 LISTEN_PORT = 6000
-BUFFER_SIZE = 4096 # For command recv and file streaming
-PEER_HOST = '0.0.0.0' # Global to store this peer's host for LIST_SHARED
-PEER_STORAGE_DIR = "peer_storage" # Directory to store uploaded encrypted files
+BUFFER_SIZE = 8192 # Increased for chunked file transfer
+PEER_HOST_LISTEN_IP = '0.0.0.0' # IP to listen on
+PEER_PUBLIC_IP = '127.0.0.1' # Publicly addressable IP for clients to connect to this peer's services
+                             # For local testing, 127.0.0.1 is fine. In real deployment, this would be the peer's public IP.
+PEER_STORAGE_DIR = "peer_storage_phase4"
 
-# --- Data Stores (In-memory for Phase 3) ---
-USER_CREDENTIALS = {} # { "username": {"salt_hex": "...", "hashed_password_hex": "..."} }
+# --- Data Stores ---
+USER_CREDENTIALS = {} # { "username": "argon2_hashed_password_string" }
 ACTIVE_SESSIONS = {}  # { "session_token": "username" }
-# Files hosted by this peer (uploaded by clients or added locally by peer admin)
-# { "original_filename.txt": {
-#       "owner_username": "...",
-#       "stored_filename_uuid": "uuid_string.enc", # Actual filename in PEER_STORAGE_DIR
-#       "file_key_hex": "...",
-#       "iv_hex": "...",
-#       "original_hash_hex": "...", # Hash of the original, unencrypted file
-#       "encrypted_size_bytes": "..."
-#   }
-# }
+# Files hosted directly by THIS peer (e.g., admin added)
+# { "original_filename.txt": { "owner_username": "peer_admin", "stored_filename_uuid": "...",
+#                              "file_key_hex": "...", "iv_hex": "...", "original_hash_hex": "...",
+#                              "encrypted_size_bytes": ... } }
 PEER_HOSTED_FILES = {}
+# Files announced by clients (peer acts as indexer)
+# { "original_filename.txt": { "owner_username": "...", "sharer_ip": "...", "sharer_port": ...,
+#                              "file_key_hex": "...", "iv_hex": "...", "original_hash_hex": "...",
+#                              "original_size_bytes": ... } } # original_size for info, encrypted_size for P2P transfer
+CLIENT_ANNOUNCED_FILES = {}
 
-def ensure_peer_storage_dir():
-    """Creates the peer storage directory if it doesn't exist."""
-    if not os.path.exists(PEER_STORAGE_DIR):
+
+def ensure_storage_dir(directory_path):
+    if not os.path.exists(directory_path):
         try:
-            os.makedirs(PEER_STORAGE_DIR)
-            print(f"{COLOR_BLUE}[PEER_SETUP] Created peer storage directory: {PEER_STORAGE_DIR}{COLOR_RESET}")
+            os.makedirs(directory_path)
+            print(f"{COLOR_BLUE}[PEER_SETUP] Created directory: {directory_path}{COLOR_RESET}")
         except OSError as e:
-            print(f"{COLOR_RED}[PEER_SETUP] CRITICAL: Could not create peer storage directory '{PEER_STORAGE_DIR}': {e}{COLOR_RESET}")
-            sys.exit(1) # Exit if storage can't be created
+            print(f"{COLOR_RED}[PEER_SETUP] CRITICAL: Could not create directory '{directory_path}': {e}{COLOR_RESET}")
+            sys.exit(1)
 
-def generate_session_token():
-    return secrets.token_hex(16)
-
-def get_username_from_token(token):
-    return ACTIVE_SESSIONS.get(token)
+def generate_session_token(): return secrets.token_hex(16)
+def get_username_from_token(token): return ACTIVE_SESSIONS.get(token)
 
 def handle_client_connection(client_socket, client_address):
-    client_addr_str_colored = f"{COLOR_MAGENTA}{client_address[0]}:{client_address[1]}{COLOR_RESET}"
-    print(f"{COLOR_GREEN}[PEER] Accepted connection from {client_addr_str_colored}{COLOR_RESET}")
+    client_ip, client_port = client_address
+    client_addr_str_colored = f"{COLOR_MAGENTA}{client_ip}:{client_port}{COLOR_RESET}"
+    print(f"{COLOR_GREEN}[PEER] Connection from {client_addr_str_colored}{COLOR_RESET}")
     current_user_session_token = None
 
     try:
         while True:
             message_bytes = client_socket.recv(BUFFER_SIZE)
-            if not message_bytes:
-                print(f"{COLOR_YELLOW}[PEER] Connection closed by {client_addr_str_colored}{COLOR_RESET}")
-                break
-
+            if not message_bytes: print(f"{COLOR_YELLOW}[PEER] Conn closed by {client_addr_str_colored}{COLOR_RESET}"); break
+            
             try:
                 message = json.loads(message_bytes.decode('utf-8'))
                 command = message.get("command")
-                print(f"{COLOR_BLUE}[PEER] Received command: {COLOR_CYAN}{command}{COLOR_BLUE} from {client_addr_str_colored}{COLOR_RESET}")
+                print(f"{COLOR_BLUE}[PEER] Cmd: {COLOR_CYAN}{command}{COLOR_BLUE} from {client_addr_str_colored}{COLOR_RESET}")
 
                 response = {"status": "ERROR", "message": "Unknown command"}
-                authenticated_username = None
-
-                if command == "REGISTER" or command == "LOGIN":
-                    # Authentication logic (same as Phase 2)
-                    username = message.get("username")
-                    password = message.get("password")
-                    if not (username and password):
-                        response = {"status": "ERROR", "message": "Username and password required."}
-                    elif command == "REGISTER":
-                        if username in USER_CREDENTIALS:
-                            response = {"status": "ERROR", "message": "Username already exists."}
-                        else:
-                            salt_hex, hashed_password_hex = crypto_utils.hash_password_sha256(password)
-                            USER_CREDENTIALS[username] = {"salt_hex": salt_hex, "hashed_password_hex": hashed_password_hex}
+                
+                if command == "REGISTER":
+                    username, password = message.get("username"), message.get("password")
+                    if not (username and password): response = {"status": "ERROR", "message": "Username/password required."}
+                    elif username in USER_CREDENTIALS: response = {"status": "ERROR", "message": "Username exists."}
+                    else:
+                        hashed_password_str = crypto_utils.hash_password_argon2(password)
+                        if hashed_password_str:
+                            USER_CREDENTIALS[username] = hashed_password_str
                             response = {"status": "OK", "message": "Registration successful."}
                             print(f"{COLOR_GREEN}[PEER] User '{username}' registered.{COLOR_RESET}")
-                    elif command == "LOGIN":
-                        user_data = USER_CREDENTIALS.get(username)
-                        if user_data and crypto_utils.verify_password_sha256(password, user_data["salt_hex"], user_data["hashed_password_hex"]):
-                            if current_user_session_token and current_user_session_token in ACTIVE_SESSIONS:
-                                ACTIVE_SESSIONS.pop(current_user_session_token, None)
-                            session_token = generate_session_token()
-                            ACTIVE_SESSIONS[session_token] = username
-                            current_user_session_token = session_token
-                            response = {"status": "OK", "message": "Login successful.", "token": session_token, "username": username}
-                            print(f"{COLOR_GREEN}[PEER] User '{username}' logged in (Token: {session_token[:8]}...).{COLOR_RESET}")
-                        else:
-                            response = {"status": "ERROR", "message": "Invalid username or password."}
+                        else: response = {"status": "ERROR", "message": "Password hashing failed on server."}
+                
+                elif command == "LOGIN":
+                    username, password = message.get("username"), message.get("password")
+                    stored_hash = USER_CREDENTIALS.get(username)
+                    if stored_hash and crypto_utils.verify_password_argon2(stored_hash, password):
+                        if current_user_session_token and current_user_session_token in ACTIVE_SESSIONS:
+                            ACTIVE_SESSIONS.pop(current_user_session_token, None)
+                        session_token = generate_session_token()
+                        ACTIVE_SESSIONS[session_token] = username
+                        current_user_session_token = session_token
+                        # For PBKDF2 salt on client, peer could generate/store one per user, or client handles it.
+                        # Let's assume client handles its own PBKDF2 salt for master key derivation for now.
+                        response = {"status": "OK", "message": "Login successful.", "token": session_token, "username": username}
+                        print(f"{COLOR_GREEN}[PEER] User '{username}' logged in (Token: {session_token[:8]}...).{COLOR_RESET}")
+                    else: response = {"status": "ERROR", "message": "Invalid username or password."}
+
                 else: # Authenticated commands
                     token = message.get("token")
-                    authenticated_username = get_username_from_token(token)
-                    if not authenticated_username:
-                        response = {"status": "ERROR", "message": "Authentication required."}
-                        print(f"{COLOR_YELLOW}[PEER] Auth failed for command '{command}'.{COLOR_RESET}")
+                    auth_user = get_username_from_token(token)
+                    if not auth_user: response = {"status": "ERROR", "message": "Authentication required."}
                     else:
-                        print(f"{COLOR_BLUE}[PEER] User: {COLOR_CYAN}{authenticated_username}{COLOR_BLUE}, Command: '{command}'{COLOR_RESET}")
+                        print(f"{COLOR_BLUE}[PEER] User: {COLOR_CYAN}{auth_user}{COLOR_BLUE}, Cmd: '{command}'{COLOR_RESET}")
                         if command == "LOGOUT":
                             if token in ACTIVE_SESSIONS: del ACTIVE_SESSIONS[token]
                             current_user_session_token = None
                             response = {"status": "OK", "message": "Logout successful."}
-                            print(f"{COLOR_GREEN}[PEER] User '{authenticated_username}' logged out.{COLOR_RESET}")
                         
-                        elif command == "UPLOAD_FILE":
-                            original_filename = message.get("original_filename")
-                            file_key_hex = message.get("file_key_hex")
-                            iv_hex = message.get("iv_hex")
-                            original_hash_hex = message.get("original_hash_hex")
-                            encrypted_size_bytes = message.get("encrypted_size_bytes")
+                        elif command == "SHARE_ANNOUNCEMENT": # Client announces a file it's willing to share P2P
+                            meta = message.get("file_metadata", {})
+                            fname = meta.get("original_filename")
+                            # Client now also sends its listening port for P2P connections
+                            sharer_listen_port = message.get("sharer_listen_port")
 
-                            if not all([original_filename, file_key_hex, iv_hex, original_hash_hex, isinstance(encrypted_size_bytes, int)]):
-                                response = {"status": "ERROR", "message": "Missing file metadata for upload."}
-                            elif original_filename in PEER_HOSTED_FILES : # Simple check, could allow overwrite or versioning
-                                response = {"status": "ERROR", "message": f"File '{original_filename}' already exists. Upload rejected."}
-                                print(f"{COLOR_YELLOW}[PEER] Upload rejected for '{original_filename}', already exists.{COLOR_RESET}")
+                            if not (fname and meta.get("file_key_hex") and meta.get("iv_hex") and 
+                                    meta.get("original_hash_hex") and isinstance(meta.get("original_size_bytes"), int) and
+                                    isinstance(sharer_listen_port, int)):
+                                response = {"status": "ERROR", "message": "Incomplete file announcement metadata."}
+                            elif fname in CLIENT_ANNOUNCED_FILES or fname in PEER_HOSTED_FILES:
+                                response = {"status": "ERROR", "message": f"Filename '{fname}' already announced or hosted."}
                             else:
-                                stored_filename_uuid = f"{uuid.uuid4()}.enc"
-                                encrypted_filepath_on_peer = os.path.join(PEER_STORAGE_DIR, stored_filename_uuid)
-                                
-                                try:
-                                    print(f"{COLOR_BLUE}[PEER] User '{authenticated_username}' uploading '{original_filename}' (encrypted size: {encrypted_size_bytes} bytes). Storing as '{stored_filename_uuid}'.{COLOR_RESET}")
-                                    client_socket.sendall(json.dumps({"status": "READY_FOR_DATA", "message": "Peer ready to receive encrypted file data."}).encode('utf-8'))
-                                    
-                                    bytes_received = 0
-                                    with open(encrypted_filepath_on_peer, 'wb') as f_enc:
-                                        while bytes_received < encrypted_size_bytes:
-                                            chunk_size_to_receive = min(BUFFER_SIZE, encrypted_size_bytes - bytes_received)
-                                            chunk = client_socket.recv(chunk_size_to_receive)
-                                            if not chunk:
-                                                print(f"{COLOR_RED}[PEER] Client disconnected during file upload of '{original_filename}'. Incomplete file.{COLOR_RESET}")
-                                                if os.path.exists(encrypted_filepath_on_peer): os.remove(encrypted_filepath_on_peer) # Clean up
-                                                response = {"status": "ERROR", "message": "Client disconnected during upload."} # This response won't reach client
-                                                raise ConnectionAbortedError("Client disconnected during upload") # Break from handler
-                                            f_enc.write(chunk)
-                                            bytes_received += len(chunk)
-                                    
-                                    if bytes_received == encrypted_size_bytes:
-                                        PEER_HOSTED_FILES[original_filename] = {
-                                            "owner_username": authenticated_username,
-                                            "stored_filename_uuid": stored_filename_uuid,
-                                            "file_key_hex": file_key_hex,
-                                            "iv_hex": iv_hex,
-                                            "original_hash_hex": original_hash_hex,
-                                            "encrypted_size_bytes": encrypted_size_bytes
-                                        }
-                                        response = {"status": "OK", "message": f"File '{original_filename}' uploaded successfully."}
-                                        print(f"{COLOR_GREEN}[PEER] File '{original_filename}' from '{authenticated_username}' stored as '{stored_filename_uuid}'.{COLOR_RESET}")
-                                    else:
-                                        # Should not happen if encrypted_size_bytes is correct and no disconnect
-                                        print(f"{COLOR_RED}[PEER] File upload size mismatch for '{original_filename}'. Expected {encrypted_size_bytes}, got {bytes_received}.{COLOR_RESET}")
-                                        if os.path.exists(encrypted_filepath_on_peer): os.remove(encrypted_filepath_on_peer)
-                                        response = {"status": "ERROR", "message": "File upload size mismatch."}
-
-                                except ConnectionAbortedError: # To catch the raised error
-                                    # Response already set, just ensure loop breaks or function exits
-                                    client_socket.close() # Close socket as client is gone
-                                    return # Exit handler for this client
-                                except Exception as e:
-                                    print(f"{COLOR_RED}[PEER] Error receiving/saving uploaded file '{original_filename}': {e}{COLOR_RESET}")
-                                    if os.path.exists(encrypted_filepath_on_peer): os.remove(encrypted_filepath_on_peer)
-                                    response = {"status": "ERROR", "message": f"Peer error during file upload: {e}"}
-                        
-                        elif command == "LIST_SHARED":
-                            files_info_list = []
-                            for orig_name, meta in PEER_HOSTED_FILES.items():
-                                files_info_list.append({
-                                    "filename": orig_name,
-                                    "owner": meta["owner_username"],
+                                CLIENT_ANNOUNCED_FILES[fname] = {
+                                    "owner_username": auth_user,
+                                    "sharer_ip": client_ip, # IP of the client making the announcement
+                                    "sharer_port": sharer_listen_port, # Client's P2P listening port
+                                    "file_key_hex": meta["file_key_hex"],
+                                    "iv_hex": meta["iv_hex"],
                                     "original_hash_hex": meta["original_hash_hex"],
-                                    "encrypted_size_bytes": meta["encrypted_size_bytes"]
-                                })
-                            response = {"status": "OK", "files": files_info_list}
-                            print(f"{COLOR_GREEN}[PEER] Sent file list to '{authenticated_username}'.{COLOR_RESET}")
+                                    "original_size_bytes": meta["original_size_bytes"]
+                                }
+                                response = {"status": "OK", "message": f"File '{fname}' announced by {auth_user}."}
+                                print(f"{COLOR_GREEN}[PEER] File '{fname}' announced by {auth_user} at {client_ip}:{sharer_listen_port}{COLOR_RESET}")
 
-                        elif command == "DOWNLOAD_FILE":
-                            original_filename = message.get("original_filename")
-                            file_meta = PEER_HOSTED_FILES.get(original_filename)
-
-                            if not file_meta:
-                                response = {"status": "ERROR", "message": "File not found on peer."}
+                        elif command == "UPLOAD_FILE_TO_PEER": # For peer_admin to upload directly to this peer
+                            # This is for files the peer itself will host (e.g. admin added)
+                            if auth_user != "peer_admin": # Simple check, could be more robust
+                                response = {"status": "ERROR", "message": "Permission denied for direct peer upload."}
                             else:
-                                encrypted_filepath_on_peer = os.path.join(PEER_STORAGE_DIR, file_meta["stored_filename_uuid"])
-                                if not os.path.exists(encrypted_filepath_on_peer):
-                                    response = {"status": "ERROR", "message": "File data missing on peer (contact admin)."}
-                                    print(f"{COLOR_RED}[PEER] File '{original_filename}' metadata exists, but data '{file_meta['stored_filename_uuid']}' missing!{COLOR_RESET}")
+                                meta = message.get("file_metadata", {})
+                                original_filename = meta.get("original_filename")
+                                encrypted_size_bytes = meta.get("encrypted_size_bytes")
+
+                                if not (original_filename and meta.get("file_key_hex") and meta.get("iv_hex") and
+                                        meta.get("original_hash_hex") and isinstance(encrypted_size_bytes, int)):
+                                    response = {"status": "ERROR", "message": "Missing metadata for peer upload."}
+                                elif original_filename in PEER_HOSTED_FILES or original_filename in CLIENT_ANNOUNCED_FILES:
+                                    response = {"status": "ERROR", "message": f"Filename '{original_filename}' conflict."}
                                 else:
-                                    # Send metadata first, then file
-                                    download_meta_response = {
-                                        "status": "READY_FOR_DOWNLOAD",
-                                        "original_filename": original_filename,
-                                        "file_key_hex": file_meta["file_key_hex"],
-                                        "iv_hex": file_meta["iv_hex"],
-                                        "original_hash_hex": file_meta["original_hash_hex"],
-                                        "encrypted_size_bytes": file_meta["encrypted_size_bytes"]
-                                    }
-                                    client_socket.sendall(json.dumps(download_meta_response).encode('utf-8'))
-                                    print(f"{COLOR_BLUE}[PEER] Sent download metadata for '{original_filename}' to '{authenticated_username}'. Streaming encrypted file...{COLOR_RESET}")
-
-                                    # Stream the encrypted file
+                                    stored_uuid = f"peer_{uuid.uuid4()}.enc"
+                                    enc_path = os.path.join(PEER_STORAGE_DIR, stored_uuid)
                                     try:
-                                        with open(encrypted_filepath_on_peer, 'rb') as f_enc:
-                                            while True:
-                                                chunk = f_enc.read(BUFFER_SIZE)
-                                                if not chunk: break
-                                                client_socket.sendall(chunk)
-                                        print(f"{COLOR_GREEN}[PEER] Finished streaming encrypted file '{original_filename}' to '{authenticated_username}'.{COLOR_RESET}")
-                                        # No further JSON response needed after streaming file data
-                                        continue # Important: skip sending the generic response below
+                                        client_socket.sendall(json.dumps({"status": "READY_FOR_DATA"}).encode())
+                                        bytes_rec = 0
+                                        with open(enc_path, 'wb') as f_enc:
+                                            while bytes_rec < encrypted_size_bytes:
+                                                chunk = client_socket.recv(min(BUFFER_SIZE, encrypted_size_bytes - bytes_rec))
+                                                if not chunk: raise ConnectionAbortedError("Client disconnected during peer upload")
+                                                f_enc.write(chunk)
+                                                bytes_rec += len(chunk)
+                                        
+                                        if bytes_rec == encrypted_size_bytes:
+                                            PEER_HOSTED_FILES[original_filename] = {
+                                                "owner_username": "peer_admin", "stored_filename_uuid": stored_uuid,
+                                                "file_key_hex": meta["file_key_hex"], "iv_hex": meta["iv_hex"],
+                                                "original_hash_hex": meta["original_hash_hex"],
+                                                "encrypted_size_bytes": encrypted_size_bytes
+                                            }
+                                            response = {"status": "OK", "message": "File uploaded to peer."}
+                                            print(f"{COLOR_GREEN}[PEER_ADMIN] File '{original_filename}' stored as '{stored_uuid}'.{COLOR_RESET}")
+                                        else: raise ValueError("Size mismatch")
                                     except Exception as e:
-                                        print(f"{COLOR_RED}[PEER] Error streaming encrypted file '{original_filename}': {e}{COLOR_RESET}")
-                                        # Client will likely timeout or error out. Hard to send JSON error now.
-                                        # Fall through to close connection.
-                        else:
-                            response = {"status": "ERROR", "message": f"Unknown authenticated command: {command}"}
-                
-                # Send response for non-streaming commands or if streaming setup failed before 'continue'
+                                        if os.path.exists(enc_path): os.remove(enc_path)
+                                        response = {"status": "ERROR", "message": f"Peer upload failed: {e}"}
+                                        if isinstance(e, ConnectionAbortedError): raise # Re-raise to break loop
+
+                        elif command == "LIST_SHARED_FILES":
+                            all_files = []
+                            for fname, meta in PEER_HOSTED_FILES.items():
+                                all_files.append({"filename": fname, "type": "peer_hosted", "owner": meta["owner_username"],
+                                                  "size_enc": meta["encrypted_size_bytes"], "hash_orig": meta["original_hash_hex"][:8]})
+                            for fname, meta in CLIENT_ANNOUNCED_FILES.items():
+                                all_files.append({"filename": fname, "type": "client_announced", "owner": meta["owner_username"],
+                                                  "sharer": f"{meta['sharer_ip']}:{meta['sharer_port']}",
+                                                  "size_orig": meta["original_size_bytes"], "hash_orig": meta["original_hash_hex"][:8]})
+                            response = {"status": "OK", "files": all_files}
+
+                        elif command == "REQUEST_DOWNLOAD_INFO": # Client wants to download
+                            fname = message.get("original_filename")
+                            if fname in PEER_HOSTED_FILES:
+                                meta = PEER_HOSTED_FILES[fname]
+                                response = {"status": "OK", "download_type": "from_peer",
+                                            "file_metadata": meta,
+                                            "peer_address": f"{PEER_PUBLIC_IP}:{LISTEN_PORT}" # This peer's address
+                                           }
+                            elif fname in CLIENT_ANNOUNCED_FILES:
+                                meta = CLIENT_ANNOUNCED_FILES[fname]
+                                response = {"status": "OK", "download_type": "from_client_p2p",
+                                            "file_metadata": meta, # Includes key, IV, hash, owner, sharer_ip, sharer_port
+                                           }
+                            else: response = {"status": "ERROR", "message": "File not found."}
+
+                        # Note: Actual file data for PEER_HOSTED_FILES is now handled by a separate request
+                        # after client gets REQUEST_DOWNLOAD_INFO and then sends a GET_PEER_HOSTED_FILE command.
+                        # This is to allow chunking and better flow control.
+                        elif command == "GET_PEER_HOSTED_FILE_DATA":
+                            fname = message.get("original_filename")
+                            meta = PEER_HOSTED_FILES.get(fname)
+                            if not meta: response = {"status": "ERROR", "message": "File not on peer."}
+                            else:
+                                enc_path = os.path.join(PEER_STORAGE_DIR, meta["stored_filename_uuid"])
+                                if not os.path.exists(enc_path):
+                                    response = {"status": "ERROR", "message": "File data missing on peer."}
+                                else:
+                                    # Send metadata again as confirmation, then stream
+                                    client_socket.sendall(json.dumps({
+                                        "status": "READY_TO_STREAM_PEER_FILE",
+                                        "original_filename": fname,
+                                        "encrypted_size_bytes": meta["encrypted_size_bytes"]
+                                    }).encode())
+                                    
+                                    print(f"{COLOR_BLUE}[PEER] Streaming '{fname}' to {client_addr_str_colored}...{COLOR_RESET}")
+                                    with open(enc_path, 'rb') as f_enc:
+                                        while True:
+                                            chunk = f_enc.read(BUFFER_SIZE)
+                                            if not chunk: break
+                                            client_socket.sendall(chunk)
+                                    print(f"{COLOR_GREEN}[PEER] Finished streaming '{fname}'.{COLOR_RESET}")
+                                    continue # Skip generic JSON response
+
                 client_socket.sendall(json.dumps(response).encode('utf-8'))
-
-            except json.JSONDecodeError:
-                print(f"{COLOR_RED}[PEER] Invalid JSON from {client_addr_str_colored}{COLOR_RESET}")
-                try: client_socket.sendall(json.dumps({"status": "ERROR", "message": "Invalid JSON"}).encode('utf-8'))
-                except Exception: pass
-            except ConnectionResetError:
-                print(f"{COLOR_RED}[PEER] Connection reset by {client_addr_str_colored}{COLOR_RESET}")
-                break 
-            except ConnectionAbortedError: # Raised by UPLOAD_FILE if client disconnects
-                print(f"{COLOR_RED}[PEER] Connection aborted by {client_addr_str_colored} during operation.{COLOR_RESET}")
-                break
-            except Exception as e:
-                print(f"{COLOR_RED}[PEER] Error handling {client_addr_str_colored}: {e}{COLOR_RESET}")
-                try: client_socket.sendall(json.dumps({"status": "ERROR", "message": "Peer server error"}).encode('utf-8'))
-                except Exception: pass
-                break 
-
-    except ConnectionResetError: pass # Already logged by inner try if it happened there
-    except Exception as e:
-        print(f"{COLOR_RED}[PEER] Unhandled outer error for {client_addr_str_colored}: {e}{COLOR_RESET}")
+            except json.JSONDecodeError: pass # Handle errors
+            except ConnectionResetError: print(f"{COLOR_RED}[PEER] Conn reset by {client_addr_str_colored}{COLOR_RESET}"); break
+            except ConnectionAbortedError: print(f"{COLOR_RED}[PEER] Conn aborted by {client_addr_str_colored}{COLOR_RESET}"); break
+            except Exception as e: print(f"{COLOR_RED}[PEER] Error for {client_addr_str_colored}: {e}{COLOR_RESET}"); break
+    except Exception: pass # Outer loop errors
     finally:
         if current_user_session_token and current_user_session_token in ACTIVE_SESSIONS:
-            user_logged_out = ACTIVE_SESSIONS.pop(current_user_session_token, None)
-            if user_logged_out: print(f"{COLOR_YELLOW}[PEER] Session for '{user_logged_out}' invalidated (disconnect).{COLOR_RESET}")
-        print(f"{COLOR_YELLOW}[PEER] Closing connection to {client_addr_str_colored}{COLOR_RESET}")
+            ACTIVE_SESSIONS.pop(current_user_session_token, None)
+        print(f"{COLOR_YELLOW}[PEER] Closing conn for {client_addr_str_colored}{COLOR_RESET}")
         client_socket.close()
 
-def start_peer_server(host='0.0.0.0', port=LISTEN_PORT):
-    global PEER_HOST # Allow modification of global PEER_HOST
-    PEER_HOST = host
-    ensure_peer_storage_dir()
+def start_main_peer_server(host=PEER_HOST_LISTEN_IP, port=LISTEN_PORT):
+    global PEER_PUBLIC_IP # Ensure it's set if not default
+    if PEER_PUBLIC_IP == '0.0.0.0' or PEER_PUBLIC_IP == '127.0.0.1':
+        print(f"{COLOR_YELLOW}[PEER_SETUP] Warning: PEER_PUBLIC_IP is '{PEER_PUBLIC_IP}'. For P2P, clients might need a reachable IP.{COLOR_RESET}")
 
-    peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    peer_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ensure_storage_dir(PEER_STORAGE_DIR)
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        peer_socket.bind((host, port))
-        peer_socket.listen(5)
-        print(f"{COLOR_GREEN}[PEER] Peer listening on {COLOR_YELLOW}{host}:{port}{COLOR_RESET}")
-        print(f"{COLOR_BLUE}[PEER] Storing uploaded files in: {os.path.abspath(PEER_STORAGE_DIR)}{COLOR_RESET}")
+        server_socket.bind((host, port))
+        server_socket.listen(5)
+        print(f"{COLOR_GREEN}[PEER] Main Peer Server listening on {host}:{port} (Publicly: {PEER_PUBLIC_IP}:{port}){COLOR_RESET}")
         while True:
-            client_sock, client_addr = peer_socket.accept()
-            thread = threading.Thread(target=handle_client_connection, args=(client_sock, client_addr))
-            thread.daemon = True
-            thread.start()
-    except OSError as e:
-        print(f"{COLOR_RED}[PEER] BIND ERROR on {host}:{port}: {e}{COLOR_RESET}")
-    except KeyboardInterrupt:
-        print(f"\n{COLOR_YELLOW}[PEER] Shutting down...{COLOR_RESET}")
-    finally:
-        peer_socket.close()
+            client_sock, client_addr = server_socket.accept()
+            threading.Thread(target=handle_client_connection, args=(client_sock, client_addr), daemon=True).start()
+    except OSError as e: print(f"{COLOR_RED}[PEER] MAIN BIND ERROR: {e}{COLOR_RESET}")
+    except KeyboardInterrupt: print(f"\n{COLOR_YELLOW}[PEER] Main Peer Shutting down...{COLOR_RESET}")
+    finally: server_socket.close()
 
-def add_file_by_peer_admin(original_filename_on_disk, display_filename=None):
-    """Allows peer admin to add a local file for sharing (encrypts and stores it)."""
-    if not os.path.exists(original_filename_on_disk):
-        print(f"{COLOR_RED}[PEER_ADMIN] File not found: {original_filename_on_disk}{COLOR_RESET}")
-        return
-
-    if display_filename is None:
-        display_filename = os.path.basename(original_filename_on_disk)
-    
-    if display_filename in PEER_HOSTED_FILES:
-        print(f"{COLOR_YELLOW}[PEER_ADMIN] File '{display_filename}' already hosted. Skipping.{COLOR_RESET}")
-        return
-
-    print(f"{COLOR_BLUE}[PEER_ADMIN] Processing '{original_filename_on_disk}' to be shared as '{display_filename}'...{COLOR_RESET}")
-    original_hash_hex = crypto_utils.hash_file_sha256(original_filename_on_disk)
-    if not original_hash_hex: return
-
-    file_key_hex, iv_hex = crypto_utils.generate_aes_key_and_iv()
-    key_bytes = bytes.fromhex(file_key_hex)
-    iv_bytes = bytes.fromhex(iv_hex)
-    
-    stored_filename_uuid = f"admin_{uuid.uuid4()}.enc"
-    encrypted_filepath_on_peer = os.path.join(PEER_STORAGE_DIR, stored_filename_uuid)
-    encrypted_size_bytes = 0
-
-    try:
-        with open(original_filename_on_disk, 'rb') as f_orig, open(encrypted_filepath_on_peer, 'wb') as f_enc:
-            while True:
-                chunk = f_orig.read(BUFFER_SIZE - (crypto_utils.algorithms.AES.block_size // 8)) # Read slightly less to allow for padding
-                if not chunk: break
-                encrypted_chunk = crypto_utils.encrypt_aes_cbc(chunk, key_bytes, iv_bytes) # IV is reused for chunks of same file here, but new IV per file
-                if not encrypted_chunk: raise Exception("Encryption failed for a chunk")
-                f_enc.write(encrypted_chunk)
-                encrypted_size_bytes += len(encrypted_chunk)
-        
-        # This chunk-by-chunk encryption with same IV is not ideal for CBC.
-        # A better approach is to encrypt the whole file at once if memory allows, or use a streaming cipher mode.
-        # For simplicity with CBC and chunks, let's re-encrypt the whole file.
-        print(f"{COLOR_YELLOW}[PEER_ADMIN] Re-encrypting whole file for proper CBC mode...{COLOR_RESET}")
-        with open(original_filename_on_disk, 'rb') as f_orig:
-            original_data = f_orig.read()
-        
-        encrypted_data = crypto_utils.encrypt_aes_cbc(original_data, key_bytes, iv_bytes)
-        if not encrypted_data:
-            raise Exception("Whole file encryption failed.")
-        
-        with open(encrypted_filepath_on_peer, 'wb') as f_enc:
-            f_enc.write(encrypted_data)
-        encrypted_size_bytes = len(encrypted_data)
-
-
-        PEER_HOSTED_FILES[display_filename] = {
-            "owner_username": "peer_admin",
-            "stored_filename_uuid": stored_filename_uuid,
-            "file_key_hex": file_key_hex,
-            "iv_hex": iv_hex,
-            "original_hash_hex": original_hash_hex,
-            "encrypted_size_bytes": encrypted_size_bytes
-        }
-        print(f"{COLOR_GREEN}[PEER_ADMIN] File '{display_filename}' is now hosted by peer. Stored as '{stored_filename_uuid}'.{COLOR_RESET}")
-    except Exception as e:
-        print(f"{COLOR_RED}[PEER_ADMIN] Error adding file '{original_filename_on_disk}': {e}{COLOR_RESET}")
-        if os.path.exists(encrypted_filepath_on_peer): os.remove(encrypted_filepath_on_peer)
+# (admin_add_file function would be similar to Phase 3, using Argon2 for a default admin pass if needed)
 
 if __name__ == "__main__":
-    ensure_peer_storage_dir()
-    # Example: Peer admin adds a local file at startup
-    admin_file_path = "peer_document.txt"
-    if not os.path.exists(admin_file_path):
-        with open(admin_file_path, "w") as f:
-            f.write("This is a document provided by the peer administrator for sharing.")
-    add_file_by_peer_admin(admin_file_path, "admin_shared_doc.txt")
+    # For testing, you might want to pre-populate USER_CREDENTIALS or PEER_HOSTED_FILES
+    # Example: USER_CREDENTIALS["admin"] = crypto_utils.hash_password_argon2("adminpass")
+    # add_file_by_peer_admin can be called here if desired.
+    # PEER_PUBLIC_IP can be configured here or via args if needed.
+    # If your machine is behind a NAT, PEER_PUBLIC_IP would be your router's public IP,
+    # and you'd need port forwarding on your router for LISTEN_PORT.
+    # For local testing, 127.0.0.1 is fine for PEER_PUBLIC_IP.
+    if len(sys.argv) > 1:
+        PEER_PUBLIC_IP = sys.argv[1]
+        print(f"{COLOR_BLUE}[PEER_SETUP] PEER_PUBLIC_IP set to {PEER_PUBLIC_IP} from command line.{COLOR_RESET}")
     
-    start_peer_server()
+    start_main_peer_server()
